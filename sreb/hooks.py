@@ -1,6 +1,6 @@
 app_name = "sreb"
 app_title = "Sreb"
-app_publisher = "You"
+app_publisher = "SR Developers"
 app_description = "Encounter Billing helpers for ERPNext Healthcare"
 app_email = "webdevelopersriaas@gmail.com"
 app_license = "MIT"
