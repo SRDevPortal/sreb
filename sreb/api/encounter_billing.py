@@ -1,6 +1,9 @@
+# sreb/api/encounter_billing.py
 import frappe
 from frappe.utils import nowdate, flt
 from erpnext.stock.get_item_details import get_item_details
+from erpnext.accounts.party import get_party_account
+
 
 def _get_patient_customer(patient: str) -> str:
     cust = frappe.db.get_value("Patient", patient, "customer")
@@ -8,11 +11,13 @@ def _get_patient_customer(patient: str) -> str:
         frappe.throw("This Patient is not linked to a Customer.")
     return cust
 
+
 def _resolve_price_list(customer: str | None) -> str | None:
     return (
         (frappe.db.get_value("Customer", customer, "default_price_list") if customer else None)
         or frappe.db.get_single_value("Selling Settings", "selling_price_list")
     )
+
 
 def _income_account_for(item_code: str, company: str) -> str:
     acc = frappe.db.get_value("Item Default", {"parent": item_code, "company": company}, "income_account")
@@ -22,12 +27,21 @@ def _income_account_for(item_code: str, company: str) -> str:
         frappe.throw("Set Income Account on Item Default or Company → Default Income Account.")
     return acc
 
+
+def _cost_center_for(item_code: str, company: str) -> str | None:
+    cc = frappe.db.get_value("Item Default", {"parent": item_code, "company": company}, "selling_cost_center")
+    if not cc:
+        cc = frappe.get_cached_value("Company", company, "cost_center", default=None)
+    return cc
+
+
 def _uom_and_cf(item_doc) -> tuple[str, float]:
     uom = item_doc.get("sales_uom") or item_doc.stock_uom
     if uom == item_doc.stock_uom:
         return uom, 1.0
     cf = frappe.db.get_value("UOM Conversion Detail", {"parent": item_doc.name, "uom": uom}, "conversion_factor")
     return uom, flt(cf or 1.0)
+
 
 def _copy_receipt_to(encounter_name: str, target_doctype: str, target_name: str, file_url: str | None):
     if not file_url:
@@ -48,9 +62,13 @@ def _copy_receipt_to(encounter_name: str, target_doctype: str, target_name: str,
     f.attached_to_name = target_name
     f.insert(ignore_permissions=True)
 
+
 @frappe.whitelist()
 def make_draft_invoice_and_payments(encounter_name: str, cfg: dict):
-    """Create DRAFT Sales Invoice + DRAFT Payment Entries from Patient Encounter."""
+    """
+    Create DRAFT Sales Invoice + DRAFT Payment Entries from Patient Encounter.
+    Fills all mandatory fields and links payments to the SI.
+    """
     enc = frappe.get_doc("Patient Encounter", encounter_name)
     customer = _get_patient_customer(enc.patient)
 
@@ -66,13 +84,20 @@ def make_draft_invoice_and_payments(encounter_name: str, cfg: dict):
     update_stock      = int(cfg.get("update_stock") or 0)
     warehouse         = cfg.get("warehouse")
 
+    # Currency & party accounts (helps compute base fields before validation)
+    company_currency = frappe.get_cached_value("Company", enc.company, "default_currency")
+    debit_to = get_party_account("Customer", customer, enc.company)
+
     price_list = _resolve_price_list(customer)
 
-    # Sales Invoice (DRAFT)
+    # --- Sales Invoice (DRAFT)
     si = frappe.new_doc("Sales Invoice")
     si.customer = customer
     si.company = enc.company
     si.posting_date = nowdate()
+    si.currency = company_currency           # keep it simple; base fields = rate/amount
+    si.conversion_rate = 1
+    si.debit_to = debit_to
     si.update_stock = 1 if update_stock else 0
 
     added_any = False
@@ -82,13 +107,15 @@ def make_draft_invoice_and_payments(encounter_name: str, cfg: dict):
             continue
         qty = flt(r.get(qty_field) or 1)
 
-        # Try ERPNext defaults
+        # Try ERPNext defaults first (pricing, cost center, income account, etc.)
         d = {}
         try:
             args = frappe._dict({
                 "doctype": "Sales Invoice",
                 "company": enc.company,
                 "customer": customer,
+                "currency": company_currency,
+                "conversion_rate": 1,
                 "price_list": price_list,
                 "plc_conversion_rate": 1,
                 "item_code": item_code,
@@ -100,10 +127,11 @@ def make_draft_invoice_and_payments(encounter_name: str, cfg: dict):
         except Exception:
             d = {}
 
-        # Guarantee mandatory fields
+        # Guarantee mandatory fields from Item & Company
         item_doc = frappe.get_cached_doc("Item", item_code)
         uom, conv = _uom_and_cf(item_doc)
         income_acc = d.get("income_account") or _income_account_for(item_doc.name, enc.company)
+        cost_center = d.get("cost_center") or _cost_center_for(item_doc.name, enc.company)
         rate = flt(d.get("price_list_rate") or d.get("rate") or r.get(rate_field) or 0)
 
         row = {
@@ -114,9 +142,11 @@ def make_draft_invoice_and_payments(encounter_name: str, cfg: dict):
             "conversion_factor": d.get("conversion_factor") or conv,
             "qty": qty,
             "rate": rate,
-            "amount": qty * rate,
+            "amount": qty * rate,                     # base fields will mirror since currency=company
             "income_account": income_acc,
         }
+        if cost_center:
+            row["cost_center"] = cost_center
         if warehouse:
             row["warehouse"] = warehouse
         elif d.get("warehouse"):
@@ -130,11 +160,13 @@ def make_draft_invoice_and_payments(encounter_name: str, cfg: dict):
     if not added_any:
         frappe.throw("No valid items in Draft Invoice tab.")
 
+    # Compute taxes & base fields BEFORE insert (avoids 'missing base rate/amount' popup)
     si.run_method("set_missing_values")
     si.run_method("calculate_taxes_and_totals")
+    si.flags.ignore_pricing_rule = 1
     si.insert(ignore_permissions=True)   # DRAFT
 
-    # Payment Entries (DRAFT)
+    # --- Payment Entries (DRAFT)
     pe_names = []
     receipt_url = enc.get(receipt_field)
 
